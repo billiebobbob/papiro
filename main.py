@@ -1,5 +1,5 @@
 """
-EtiquetaTron - Separa etiquetas de envío de PDFs en imágenes individuales
+EtiquetaTron - Separa etiquetas de PDFs, preview y manda a imprimir
 Desarrollado para Mawida Dispensario
 """
 
@@ -14,58 +14,144 @@ import sys
 import subprocess
 import threading
 
-# Dimensiones EXACTAS de salida: 135mm x 59mm a 300 DPI
-FINAL_WIDTH_PX = 1594   # 135mm a 300 DPI
-FINAL_HEIGHT_PX = 697   # 59mm a 300 DPI
+DPI = 300
+
+def mm_to_px(mm):
+    return int(mm * DPI / 25.4)
+
+CANVAS_WIDTH_MM = 62
+
+LABEL_FORMATS = {
+    "Envio": {
+        "description": "Envio (14cm x 3cm)",
+        "canvas_width_mm": 140,
+        "canvas_height_mm": CANVAS_WIDTH_MM,
+    },
+    "Producto": {
+        "description": "Producto (6.2cm x 3.3cm)",
+        "canvas_width_mm": CANVAS_WIDTH_MM,
+        "canvas_height_mm": 33,
+    },
+}
+
+PDF_LABEL_SPACING_PTS = 130
+PDF_LABEL_HEIGHT_PTS = 120
+PDF_MARGIN_TOP_PTS = 5
+PDF_MARGIN_SIDES_PTS = 10
+PDF_MAX_LABELS_PER_PAGE = 6
+
+PREVIEW_MAX_WIDTH = 520
+PREVIEW_MAX_HEIGHT = 160
+
+# Color palette
+BG_DARK = "#1a1a2e"
+BG_CARD = "#16213e"
+BG_CARD_LIGHT = "#1c2a4a"
+ACCENT_BLUE = "#0f7dff"
+ACCENT_GREEN = "#00c853"
+ACCENT_ORANGE = "#ff6d00"
+ACCENT_CYAN = "#00e5ff"
+TEXT_PRIMARY = "#e8eaf6"
+TEXT_SECONDARY = "#7986cb"
+TEXT_MUTED = "#455a80"
+BORDER_COLOR = "#263159"
+
+
+def get_printers():
+    printers = []
+    try:
+        if sys.platform == 'darwin' or sys.platform.startswith('linux'):
+            result = subprocess.run(['lpstat', '-p'], capture_output=True, text=True, timeout=5)
+            for line in result.stdout.strip().split('\n'):
+                if line.startswith('printer '):
+                    printers.append(line.split()[1])
+        elif sys.platform == 'win32':
+            result = subprocess.run(['wmic', 'printer', 'get', 'name'], capture_output=True, text=True, timeout=5)
+            for line in result.stdout.strip().split('\n')[1:]:
+                name = line.strip()
+                if name:
+                    printers.append(name)
+    except Exception:
+        pass
+    return printers
+
+
+def get_default_printer():
+    try:
+        if sys.platform == 'darwin' or sys.platform.startswith('linux'):
+            result = subprocess.run(['lpstat', '-d'], capture_output=True, text=True, timeout=5)
+            for line in result.stdout.strip().split('\n'):
+                if 'default' in line.lower() and ':' in line:
+                    return line.split(':')[-1].strip()
+    except Exception:
+        pass
+    return None
+
+
+def print_image(filepath, printer_name=None):
+    if sys.platform in ('darwin',) or sys.platform.startswith('linux'):
+        cmd = ['lp']
+        if printer_name:
+            cmd.extend(['-d', printer_name])
+        cmd.append(filepath)
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    elif sys.platform == 'win32':
+        os.startfile(filepath, 'print')
+        return None
 
 
 class EtiquetaSeparador(ctk.CTk):
     def __init__(self):
         super().__init__()
 
-        # Configuración de la ventana
-        self.title("EtiquetaTron - Mawida")
-        self.geometry("600x580")
-        self.resizable(False, False)
+        self.title("EtiquetaTron")
+        self.geometry("640x600")
+        self.resizable(True, True)
+        self.minsize(600, 540)
+        self.configure(fg_color=BG_DARK)
 
-        # Tema oscuro moderno
         ctk.set_appearance_mode("dark")
-        ctk.set_default_color_theme("blue")
 
-        # Variables
         self.pdf_path = None
         self.processing = False
+        self.selected_format = ctk.StringVar(value="Envio")
+        self.selected_printer = ctk.StringVar(value="")
 
-        # Crear interfaz
+        self.preview_labels = []
+        self.preview_index = 0
+        self.preview_tk_image = None
+        self.last_output_dir = None
+
+        self.printers = get_printers()
+        default = get_default_printer()
+        if default and default in self.printers:
+            self.selected_printer.set(default)
+        elif self.printers:
+            self.selected_printer.set(self.printers[0])
+
         self.create_widgets()
-
-        # Centrar ventana
         self.center_window()
+
+        self.bind('<Left>', self._preview_prev)
+        self.bind('<Right>', self._preview_next)
 
     def center_window(self):
         self.update_idletasks()
-        width = self.winfo_width()
-        height = self.winfo_height()
-        x = (self.winfo_screenwidth() // 2) - (width // 2)
-        y = (self.winfo_screenheight() // 2) - (height // 2)
-        self.geometry(f'{width}x{height}+{x}+{y}')
+        w, h = self.winfo_width(), self.winfo_height()
+        x = (self.winfo_screenwidth() // 2) - (w // 2)
+        y = (self.winfo_screenheight() // 2) - (h // 2)
+        self.geometry(f'{w}x{h}+{x}+{y}')
 
     def _load_logo(self):
-        """Carga el logo de Mawida desde archivo o recurso empaquetado."""
         try:
-            # Buscar logo en diferentes ubicaciones
             if getattr(sys, 'frozen', False):
-                # Ejecutable PyInstaller
                 base_path = sys._MEIPASS
             else:
                 base_path = os.path.dirname(os.path.abspath(__file__))
-
             logo_path = os.path.join(base_path, 'logo.png')
-
             if os.path.exists(logo_path):
                 img = Image.open(logo_path)
-                # Redimensionar manteniendo proporción (ancho máximo 280px)
-                max_width = 280
+                max_width = 38
                 ratio = max_width / img.width
                 new_height = int(img.height * ratio)
                 img = img.resize((max_width, new_height), Image.LANCZOS)
@@ -74,299 +160,396 @@ class EtiquetaSeparador(ctk.CTk):
             pass
         return None
 
-    def create_widgets(self):
-        # Frame principal con padding
-        self.main_frame = ctk.CTkFrame(self, corner_radius=0)
-        self.main_frame.pack(fill="both", expand=True, padx=20, pady=20)
+    def _get_canvas_size(self):
+        fmt = LABEL_FORMATS[self.selected_format.get()]
+        return mm_to_px(fmt["canvas_width_mm"]), mm_to_px(fmt["canvas_height_mm"])
 
-        # Logo de Mawida
+    def _on_format_change(self, *args):
+        fmt = LABEL_FORMATS[self.selected_format.get()]
+        self.format_detail.configure(text=f"{fmt['canvas_width_mm']}x{fmt['canvas_height_mm']}mm")
+
+    def _refresh_printers(self):
+        self.printers = get_printers()
+        if self.printers:
+            self.printer_menu.configure(values=self.printers)
+            if self.selected_printer.get() not in self.printers:
+                default = get_default_printer()
+                self.selected_printer.set(default if default and default in self.printers else self.printers[0])
+        else:
+            self.printer_menu.configure(values=["Sin impresora"])
+            self.selected_printer.set("Sin impresora")
+
+    def create_widgets(self):
+        self.main_frame = ctk.CTkFrame(self, corner_radius=0, fg_color=BG_DARK)
+        self.main_frame.pack(fill="both", expand=True, padx=16, pady=12)
+
+        # === HEADER ===
+        header = ctk.CTkFrame(self.main_frame, fg_color="transparent")
+        header.pack(fill="x", pady=(0, 10))
+
         self.logo_image = self._load_logo()
         if self.logo_image:
-            self.logo_label = ctk.CTkLabel(
-                self.main_frame,
-                image=self.logo_image,
-                text=""
-            )
-            self.logo_label.pack(pady=(10, 5))
+            ctk.CTkLabel(header, image=self.logo_image, text="").pack(side="left", padx=(0, 10))
 
-        # Título
-        self.title_label = ctk.CTkLabel(
-            self.main_frame,
-            text="EtiquetaTron",
-            font=ctk.CTkFont(size=24, weight="bold")
+        ctk.CTkLabel(header, text="EtiquetaTron",
+                     font=ctk.CTkFont(size=22, weight="bold"),
+                     text_color=TEXT_PRIMARY).pack(side="left")
+
+        ctk.CTkLabel(header, text="Mawida Dispensario",
+                     font=ctk.CTkFont(size=10),
+                     text_color=TEXT_MUTED).pack(side="right", padx=(0, 4))
+
+        # === CONFIG CARD ===
+        config_card = ctk.CTkFrame(self.main_frame, fg_color=BG_CARD, corner_radius=12,
+                                   border_width=1, border_color=BORDER_COLOR)
+        config_card.pack(fill="x", pady=(0, 8))
+
+        # Row 1: Format
+        row1 = ctk.CTkFrame(config_card, fg_color="transparent")
+        row1.pack(fill="x", padx=14, pady=(10, 4))
+
+        ctk.CTkLabel(row1, text="FORMATO", font=ctk.CTkFont(size=9, weight="bold"),
+                     text_color=TEXT_MUTED).pack(side="left", padx=(0, 12))
+
+        for fmt_name in LABEL_FORMATS:
+            ctk.CTkRadioButton(
+                row1, text=fmt_name, variable=self.selected_format,
+                value=fmt_name, font=ctk.CTkFont(size=11),
+                text_color=TEXT_PRIMARY,
+                command=self._on_format_change,
+                radiobutton_width=16, radiobutton_height=16,
+                fg_color=ACCENT_BLUE, hover_color=ACCENT_BLUE,
+                border_color=TEXT_MUTED
+            ).pack(side="left", padx=8)
+
+        self.format_detail = ctk.CTkLabel(row1, text="140x62mm",
+                                          font=ctk.CTkFont(size=10),
+                                          text_color=ACCENT_CYAN)
+        self.format_detail.pack(side="right")
+        self._on_format_change()
+
+        # Divider
+        ctk.CTkFrame(config_card, height=1, fg_color=BORDER_COLOR).pack(fill="x", padx=14, pady=4)
+
+        # Row 2: Printer
+        row2 = ctk.CTkFrame(config_card, fg_color="transparent")
+        row2.pack(fill="x", padx=14, pady=(4, 10))
+
+        ctk.CTkLabel(row2, text="IMPRESORA", font=ctk.CTkFont(size=9, weight="bold"),
+                     text_color=TEXT_MUTED).pack(side="left", padx=(0, 8))
+
+        printer_values = self.printers if self.printers else ["Sin impresora"]
+        self.printer_menu = ctk.CTkOptionMenu(
+            row2, variable=self.selected_printer,
+            values=printer_values, font=ctk.CTkFont(size=10),
+            width=280, height=28, corner_radius=6,
+            fg_color=BG_CARD_LIGHT, button_color=ACCENT_BLUE,
+            button_hover_color="#0d6efd",
+            text_color=TEXT_PRIMARY
         )
-        self.title_label.pack(pady=(5, 5))
+        self.printer_menu.pack(side="left", padx=4)
 
-        self.subtitle_label = ctk.CTkLabel(
-            self.main_frame,
-            text="Convierte PDFs de etiquetas en imágenes individuales",
-            font=ctk.CTkFont(size=12),
-            text_color="gray"
-        )
-        self.subtitle_label.pack(pady=(0, 20))
+        ctk.CTkButton(
+            row2, text="Refresh", width=60, height=26, corner_radius=6,
+            font=ctk.CTkFont(size=9), command=self._refresh_printers,
+            fg_color="transparent", border_width=1, border_color=TEXT_MUTED,
+            text_color=TEXT_SECONDARY, hover_color=BG_CARD_LIGHT
+        ).pack(side="right")
 
-        # Frame para selección de archivo
-        self.file_frame = ctk.CTkFrame(self.main_frame, fg_color="transparent")
-        self.file_frame.pack(fill="x", padx=20, pady=10)
-
-        self.file_label = ctk.CTkLabel(
-            self.file_frame,
-            text="Ningún archivo seleccionado",
-            font=ctk.CTkFont(size=12),
-            text_color="gray"
-        )
-        self.file_label.pack(pady=(0, 10))
+        # === LOAD BUTTON ===
+        load_row = ctk.CTkFrame(self.main_frame, fg_color="transparent")
+        load_row.pack(fill="x", pady=(0, 6))
 
         self.select_button = ctk.CTkButton(
-            self.file_frame,
-            text="📁  Seleccionar PDF",
-            font=ctk.CTkFont(size=14, weight="bold"),
-            height=45,
-            width=250,
-            corner_radius=10,
-            command=self.select_pdf
+            load_row, text="Cargar PDF",
+            font=ctk.CTkFont(size=12, weight="bold"),
+            height=36, width=160, corner_radius=8,
+            fg_color=ACCENT_BLUE, hover_color="#0d6efd",
+            text_color="white",
+            command=self.load_and_preview
         )
-        self.select_button.pack(pady=10)
+        self.select_button.pack(side="left")
 
-        # Separador visual
-        self.separator = ctk.CTkFrame(self.main_frame, height=2, fg_color="gray30")
-        self.separator.pack(fill="x", padx=40, pady=20)
+        self.file_label = ctk.CTkLabel(
+            load_row, text="Ningun archivo seleccionado",
+            font=ctk.CTkFont(size=10), text_color=TEXT_MUTED
+        )
+        self.file_label.pack(side="left", padx=(10, 0))
 
-        # Botón de procesar
-        self.process_button = ctk.CTkButton(
-            self.main_frame,
-            text="⚡  Procesar Etiquetas",
-            font=ctk.CTkFont(size=16, weight="bold"),
-            height=50,
-            width=280,
-            corner_radius=10,
-            fg_color="#28a745",
-            hover_color="#218838",
-            command=self.process_pdf,
+        # === PREVIEW CARD ===
+        preview_card = ctk.CTkFrame(self.main_frame, fg_color=BG_CARD, corner_radius=12,
+                                    border_width=1, border_color=BORDER_COLOR)
+        preview_card.pack(fill="x", pady=(0, 8))
+
+        # Nav bar
+        nav = ctk.CTkFrame(preview_card, fg_color="transparent")
+        nav.pack(fill="x", padx=10, pady=(8, 0))
+
+        self.prev_btn = ctk.CTkButton(
+            nav, text="<", width=30, height=26, corner_radius=6,
+            font=ctk.CTkFont(size=13, weight="bold"),
+            fg_color=BG_CARD_LIGHT, hover_color=BORDER_COLOR,
+            text_color=TEXT_SECONDARY,
+            command=lambda: self._preview_prev(None), state="disabled"
+        )
+        self.prev_btn.pack(side="left")
+
+        self.preview_counter_label = ctk.CTkLabel(
+            nav, text="Sin etiquetas",
+            font=ctk.CTkFont(size=11), text_color=TEXT_SECONDARY
+        )
+        self.preview_counter_label.pack(side="left", expand=True)
+
+        self.preview_name_label = ctk.CTkLabel(
+            nav, text="", font=ctk.CTkFont(size=11, weight="bold"),
+            text_color=ACCENT_CYAN
+        )
+        self.preview_name_label.pack(side="left", expand=True)
+
+        self.next_btn = ctk.CTkButton(
+            nav, text=">", width=30, height=26, corner_radius=6,
+            font=ctk.CTkFont(size=13, weight="bold"),
+            fg_color=BG_CARD_LIGHT, hover_color=BORDER_COLOR,
+            text_color=TEXT_SECONDARY,
+            command=lambda: self._preview_next(None), state="disabled"
+        )
+        self.next_btn.pack(side="right")
+
+        # Preview image
+        self.preview_image_label = ctk.CTkLabel(
+            preview_card, text="Carga un PDF para previsualizar",
+            font=ctk.CTkFont(size=10), text_color=TEXT_MUTED,
+            height=PREVIEW_MAX_HEIGHT
+        )
+        self.preview_image_label.pack(padx=10, pady=(4, 10))
+
+        # === ACTION BUTTONS ===
+        action_frame = ctk.CTkFrame(self.main_frame, fg_color="transparent")
+        action_frame.pack(fill="x", pady=(0, 6))
+
+        # Center buttons using inner frame
+        btn_container = ctk.CTkFrame(action_frame, fg_color="transparent")
+        btn_container.pack(anchor="center")
+
+        self.save_button = ctk.CTkButton(
+            btn_container, text="Guardar",
+            font=ctk.CTkFont(size=11, weight="bold"),
+            height=34, width=130, corner_radius=8,
+            fg_color="transparent", border_width=1,
+            border_color=ACCENT_BLUE, text_color=ACCENT_BLUE,
+            hover_color=BG_CARD,
+            command=lambda: self.save_and_print(send_to_printer=False),
             state="disabled"
         )
-        self.process_button.pack(pady=10)
+        self.save_button.pack(side="left", padx=4)
 
-        # Barra de progreso
-        self.progress_frame = ctk.CTkFrame(self.main_frame, fg_color="transparent")
-        self.progress_frame.pack(fill="x", padx=40, pady=(20, 10))
+        self.print_button = ctk.CTkButton(
+            btn_container, text="Guardar + Imprimir",
+            font=ctk.CTkFont(size=11, weight="bold"),
+            height=34, width=170, corner_radius=8,
+            fg_color=ACCENT_GREEN, hover_color="#00a844",
+            text_color="#0a0a0a",
+            command=lambda: self.save_and_print(send_to_printer=True),
+            state="disabled"
+        )
+        self.print_button.pack(side="left", padx=4)
 
-        self.progress_bar = ctk.CTkProgressBar(self.progress_frame, height=8, corner_radius=4)
-        self.progress_bar.pack(fill="x")
+        self.print_all_button = ctk.CTkButton(
+            btn_container, text="Imprimir Todas",
+            font=ctk.CTkFont(size=11, weight="bold"),
+            height=34, width=140, corner_radius=8,
+            fg_color=ACCENT_ORANGE, hover_color="#e65100",
+            text_color="#0a0a0a",
+            command=lambda: self.save_and_print(send_to_printer=True),
+            state="disabled"
+        )
+        self.print_all_button.pack(side="left", padx=4)
+
+        # === PROGRESS ===
+        self.progress_bar = ctk.CTkProgressBar(
+            self.main_frame, height=3, corner_radius=2,
+            progress_color=ACCENT_BLUE, fg_color=BORDER_COLOR
+        )
+        self.progress_bar.pack(fill="x", padx=4, pady=(0, 6))
         self.progress_bar.set(0)
 
-        self.progress_label = ctk.CTkLabel(
-            self.progress_frame,
-            text="",
-            font=ctk.CTkFont(size=11),
-            text_color="gray"
-        )
-        self.progress_label.pack(pady=(5, 0))
+        # === LOG ===
+        log_card = ctk.CTkFrame(self.main_frame, fg_color=BG_CARD, corner_radius=10,
+                                border_width=1, border_color=BORDER_COLOR)
+        log_card.pack(fill="both", expand=True)
 
-        # Área de resultados
-        self.result_frame = ctk.CTkFrame(self.main_frame, fg_color="gray20", corner_radius=10)
-        self.result_frame.pack(fill="both", expand=True, padx=20, pady=(10, 20))
-
-        # Fuente monoespaciada compatible con todos los sistemas
-        if sys.platform == 'darwin':
-            mono_font = "Menlo"
-        elif sys.platform == 'win32':
-            mono_font = "Consolas"
-        else:
-            mono_font = "DejaVu Sans Mono"
-
+        mono = "Menlo" if sys.platform == 'darwin' else ("Consolas" if sys.platform == 'win32' else "DejaVu Sans Mono")
         self.result_text = ctk.CTkTextbox(
-            self.result_frame,
-            font=ctk.CTkFont(size=11, family=mono_font),
-            fg_color="transparent",
-            height=120
+            log_card, font=ctk.CTkFont(size=9, family=mono),
+            fg_color="transparent", text_color=TEXT_SECONDARY, height=50
         )
-        self.result_text.pack(fill="both", expand=True, padx=10, pady=10)
-        self.result_text.insert("1.0", "Los resultados aparecerán aquí...")
+        self.result_text.pack(fill="both", expand=True, padx=8, pady=8)
+        self.result_text.insert("1.0", "Listo para trabajar...")
         self.result_text.configure(state="disabled")
 
-        # Créditos
-        self.credits_label = ctk.CTkLabel(
-            self.main_frame,
-            text="Mawida Dispensario",
-            font=ctk.CTkFont(size=11, weight="bold"),
-            text_color="#1a5276"
-        )
-        self.credits_label.pack(pady=(0, 5))
+    # --- Preview ---
+    def _preview_prev(self, event):
+        if self.preview_labels:
+            self.preview_index = (self.preview_index - 1) % len(self.preview_labels)
+            self._show_preview()
 
-    def select_pdf(self):
+    def _preview_next(self, event):
+        if self.preview_labels:
+            self.preview_index = (self.preview_index + 1) % len(self.preview_labels)
+            self._show_preview()
+
+    def _show_preview(self):
+        if not self.preview_labels:
+            self.preview_image_label.configure(image=None, text="Carga un PDF para previsualizar")
+            self.preview_counter_label.configure(text="Sin etiquetas")
+            self.preview_name_label.configure(text="")
+            self.prev_btn.configure(state="disabled")
+            self.next_btn.configure(state="disabled")
+            return
+
+        data = self.preview_labels[self.preview_index]
+        img = data['image']
+        img_w, img_h = img.size
+        scale = min(PREVIEW_MAX_WIDTH / img_w, PREVIEW_MAX_HEIGHT / img_h, 1.0)
+        dw, dh = max(int(img_w * scale), 1), max(int(img_h * scale), 1)
+
+        img_resized = img.resize((dw, dh), Image.LANCZOS)
+        self.preview_tk_image = ctk.CTkImage(light_image=img_resized, dark_image=img_resized, size=(dw, dh))
+        self.preview_image_label.configure(image=self.preview_tk_image, text="", height=PREVIEW_MAX_HEIGHT)
+
+        total = len(self.preview_labels)
+        self.preview_counter_label.configure(text=f"{self.preview_index + 1} / {total}")
+        self.preview_name_label.configure(text=data['venta'])
+
+        state = "normal" if total > 1 else "disabled"
+        self.prev_btn.configure(state=state)
+        self.next_btn.configure(state=state)
+
+    # --- Load ---
+    def load_and_preview(self):
         file_path = filedialog.askopenfilename(
             title="Seleccionar PDF de etiquetas",
             filetypes=[("Archivos PDF", "*.pdf"), ("Todos los archivos", "*.*")]
         )
-
-        if file_path:
-            self.pdf_path = file_path
-            filename = os.path.basename(file_path)
-            self.file_label.configure(text=f"📄 {filename}", text_color="white")
-            self.process_button.configure(state="normal")
-            self.log_message(f"Archivo seleccionado: {filename}")
-
-    def log_message(self, message):
-        self.result_text.configure(state="normal")
-        self.result_text.delete("1.0", "end")
-        self.result_text.insert("1.0", message)
-        self.result_text.configure(state="disabled")
-
-    def append_log(self, message):
-        self.result_text.configure(state="normal")
-        self.result_text.insert("end", f"\n{message}")
-        self.result_text.see("end")
-        self.result_text.configure(state="disabled")
-
-    def process_pdf(self):
-        if self.processing:
+        if not file_path:
             return
-
-        # Validar que el archivo existe antes de procesar
-        if not self.pdf_path or not os.path.isfile(self.pdf_path):
-            messagebox.showerror("Error", "El archivo PDF no existe o fue eliminado.")
-            self.pdf_path = None
-            self.file_label.configure(text="Ningún archivo seleccionado", text_color="gray")
-            self.process_button.configure(state="disabled")
-            return
-
-        self.processing = True
-        self.process_button.configure(state="disabled", text="⏳ Procesando...")
-        self.select_button.configure(state="disabled")
+        self.pdf_path = file_path
+        self.file_label.configure(text=os.path.basename(file_path), text_color=TEXT_PRIMARY)
+        self.log_message(f"Cargando: {os.path.basename(file_path)}")
         self.progress_bar.set(0)
-
-        # Procesar en hilo separado para no bloquear la UI
-        thread = threading.Thread(target=self._process_pdf_thread)
+        self.select_button.configure(state="disabled")
+        thread = threading.Thread(target=self._load_preview_thread)
         thread.daemon = True
         thread.start()
 
-    def _process_pdf_thread(self):
+    def _load_preview_thread(self):
         doc = None
         try:
-            self.after(0, lambda: self.log_message("Iniciando procesamiento..."))
-
-            # Abrir PDF
+            canvas_w, canvas_h = self._get_canvas_size()
             doc = fitz.open(self.pdf_path)
             total_pages = len(doc)
-
             if total_pages == 0:
-                raise ValueError("El PDF está vacío")
+                raise ValueError("PDF vacio")
 
-            self.after(0, lambda t=total_pages: self.append_log(f"PDF abierto: {t} página(s)"))
+            self.after(0, lambda t=total_pages: self.append_log(f"PDF: {t} pag"))
+            labels = []
+            render_scale = DPI / 72
 
-            # Extraer fecha del primer texto
-            first_page_text = doc[0].get_text()
-            date_match = re.search(r'(\d{1,2}/\d{1,2}/\d{4})', first_page_text)
+            for page_num in range(total_pages):
+                self.after(0, lambda p=(page_num+1)/total_pages: self.progress_bar.set(p))
+                page = doc[page_num]
+                page_rect = page.rect
+                page_text = page.get_text()
 
+                ventas = re.findall(r'Venta:\s*(S\d+)', page_text)
+                if not ventas:
+                    ventas = [f"etiqueta_p{page_num+1}"]
+
+                for i, venta in enumerate(ventas):
+                    if i >= PDF_MAX_LABELS_PER_PAGE:
+                        break
+                    y_top = PDF_MARGIN_TOP_PTS + (i * PDF_LABEL_SPACING_PTS)
+                    y_bottom = y_top + PDF_LABEL_HEIGHT_PTS
+                    label_rect = fitz.Rect(PDF_MARGIN_SIDES_PTS, y_top, page_rect.width - PDF_MARGIN_SIDES_PTS, y_bottom) & page_rect
+                    pix = page.get_pixmap(matrix=fitz.Matrix(render_scale, render_scale), clip=label_rect)
+                    label_img = Image.open(io.BytesIO(pix.tobytes("png")))
+                    labels.append({'image': self._fit_to_canvas(label_img, canvas_w, canvas_h), 'venta': venta})
+
+                self.after(0, lambda p=page_num+1, t=total_pages, v=len(ventas):
+                    self.append_log(f"Pag {p}/{t}: {v} etiquetas"))
+
+            doc.close()
+            doc = None
+            self.after(0, lambda: self._set_preview_data(labels))
+        except Exception as e:
+            self.after(0, lambda err=str(e): self._handle_error(err))
+        finally:
+            if doc:
+                try: doc.close()
+                except: pass
+            self.after(0, lambda: self.select_button.configure(state="normal"))
+
+    def _set_preview_data(self, labels):
+        self.preview_labels = labels
+        self.preview_index = 0
+        if labels:
+            self.append_log(f"Total: {len(labels)} etiquetas")
+            self.save_button.configure(state="normal")
+            self.print_button.configure(state="normal")
+            self.print_all_button.configure(state="normal")
+        else:
+            self.save_button.configure(state="disabled")
+            self.print_button.configure(state="disabled")
+            self.print_all_button.configure(state="disabled")
+        self._show_preview()
+        self.progress_bar.set(1.0)
+
+    # --- Save/Print ---
+    def save_and_print(self, send_to_printer=False):
+        if self.processing or not self.preview_labels:
+            return
+        if send_to_printer:
+            printer = self.selected_printer.get()
+            if not printer or printer == "Sin impresora":
+                messagebox.showwarning("Sin impresora", "No hay impresora seleccionada.")
+                return
+        self.processing = True
+        self.save_button.configure(state="disabled")
+        self.print_button.configure(state="disabled")
+        self.select_button.configure(state="disabled")
+        self.progress_bar.set(0)
+        thread = threading.Thread(target=self._save_print_thread, args=(send_to_printer,))
+        thread.daemon = True
+        thread.start()
+
+    def _save_print_thread(self, send_to_printer):
+        try:
+            fmt_name = self.selected_format.get()
+            printer = self.selected_printer.get() if send_to_printer else None
+
+            doc = fitz.open(self.pdf_path)
+            first_text = doc[0].get_text()
+            doc.close()
+
+            date_match = re.search(r'(\d{1,2}/\d{1,2}/\d{4})', first_text)
             if date_match:
-                date_str = date_match.group(1)
-                parts = date_str.split('/')
+                parts = date_match.group(1).split('/')
                 folder_date = f"{parts[2]}-{parts[1].zfill(2)}-{parts[0].zfill(2)}"
             else:
                 folder_date = "sin_fecha"
 
-            self.after(0, lambda fd=folder_date: self.append_log(f"Fecha detectada: {fd}"))
-
-            # Crear carpeta de salida
-            if getattr(sys, 'frozen', False):
-                exe_dir = os.path.dirname(sys.executable)
-            else:
-                exe_dir = os.path.dirname(os.path.abspath(__file__))
-            output_dir = os.path.join(exe_dir, "etiquetas", folder_date)
+            exe_dir = os.path.dirname(sys.executable) if getattr(sys, 'frozen', False) else os.path.dirname(os.path.abspath(__file__))
+            output_dir = os.path.join(exe_dir, "etiquetas", fmt_name.lower(), folder_date)
             os.makedirs(output_dir, exist_ok=True)
 
-            self.after(0, lambda fd=folder_date: self.append_log(f"Carpeta: etiquetas/{fd}/"))
-
-            # Procesar cada página
-            all_labels = []
-
-            for page_num in range(total_pages):
-                progress = (page_num + 1) / total_pages * 0.5
-                self.after(0, lambda p=progress: self.progress_bar.set(p))
-
-                page = doc[page_num]
-                page_text = page.get_text()
-
-                # Buscar todos los números de venta en la página
-                ventas = re.findall(r'Venta:\s*(S\d+)', page_text)
-
-                if not ventas:
-                    continue
-
-                # Obtener dimensiones de la página
-                page_rect = page.rect
-                page_width = page_rect.width
-                page_height = page_rect.height
-
-                # Cada etiqueta: altura 120pts, espaciado 130pts (medido del PDF)
-                # 6 etiquetas por página máximo
-                label_height_pts = 120  # Altura real de la etiqueta
-                label_spacing = 130     # Espaciado entre etiquetas
-                margin_top = 5          # Y inicial de la primera etiqueta
-                margin_sides = 20       # Margen lateral
-
-                # Renderizar a 300 DPI para alta calidad
-                render_scale = 300 / 72  # 72 DPI es el estándar PDF
-
-                for i, venta in enumerate(ventas):
-                    if i >= 6:
-                        break
-
-                    # Calcular posición de esta etiqueta
-                    y_top = margin_top + (i * label_spacing)
-                    y_bottom = y_top + label_height_pts
-
-                    # Rectángulo de la etiqueta
-                    label_rect = fitz.Rect(
-                        margin_sides,
-                        y_top,
-                        page_width - margin_sides,
-                        y_bottom
-                    )
-
-                    # Asegurar que esté dentro de la página
-                    label_rect = label_rect & page_rect
-
-                    # Renderizar esta etiqueta
-                    mat = fitz.Matrix(render_scale, render_scale)
-                    pix = page.get_pixmap(matrix=mat, clip=label_rect)
-
-                    # Convertir a PIL
-                    img_data = pix.tobytes("png")
-                    label_img = Image.open(io.BytesIO(img_data))
-
-                    # Escalar al tamaño final exacto (150mm x 62mm)
-                    final_img = self._scale_to_final(label_img)
-
-                    all_labels.append({
-                        'image': final_img,
-                        'venta': venta,
-                        'page': page_num + 1
-                    })
-
-                self.after(0, lambda p=page_num+1, t=total_pages, v=len(ventas):
-                    self.append_log(f"Página {p}/{t} - {v} etiquetas"))
-
-            doc.close()
-            doc = None
-
-            if not all_labels:
-                self.after(0, lambda: self.append_log("⚠️ No se encontraron etiquetas"))
-                self.after(0, lambda: self._finish_processing(0, output_dir))
-                return
-
-            # Guardar etiquetas
-            saved_count = 0
+            self.after(0, lambda: self.log_message("Guardando..."))
+            saved = printed = 0
             used_names = {}
-            total_labels = len(all_labels)
+            total = len(self.preview_labels)
 
-            for i, label in enumerate(all_labels):
-                progress = 0.5 + (i + 1) / total_labels * 0.5
-                self.after(0, lambda p=progress: self.progress_bar.set(p))
-
+            for i, label in enumerate(self.preview_labels):
+                self.after(0, lambda p=(i+1)/total: self.progress_bar.set(p))
                 venta = label['venta']
-
                 if venta in used_names:
                     used_names[venta] += 1
                     filename = f"{venta}_{used_names[venta]}.png"
@@ -375,96 +558,117 @@ class EtiquetaSeparador(ctk.CTk):
                     filename = f"{venta}.png"
 
                 filepath = os.path.join(output_dir, filename)
-                label['image'].save(filepath, 'PNG', dpi=(300, 300))
-                saved_count += 1
+                label['image'].save(filepath, 'PNG', dpi=(DPI, DPI))
+                saved += 1
+
+                if send_to_printer and printer:
+                    try:
+                        result = print_image(filepath, printer)
+                        if result and result.returncode == 0:
+                            printed += 1
+                    except Exception:
+                        pass
 
             self.after(0, lambda: self.progress_bar.set(1.0))
-            self.after(0, lambda: self._finish_processing(saved_count, output_dir))
-
+            self.after(0, lambda: self._finish_processing(saved, printed, output_dir))
         except Exception as e:
             self.after(0, lambda err=str(e): self._handle_error(err))
-        finally:
-            if doc is not None:
+
+    def print_all_from_folder(self):
+        if not self.last_output_dir or not os.path.isdir(self.last_output_dir):
+            messagebox.showwarning("Sin carpeta", "Primero debes guardar las etiquetas.")
+            return
+        printer = self.selected_printer.get()
+        if not printer or printer == "Sin impresora":
+            messagebox.showwarning("Sin impresora", "No hay impresora seleccionada.")
+            return
+
+        files = sorted([f for f in os.listdir(self.last_output_dir) if f.lower().endswith('.png')])
+        if not files:
+            messagebox.showwarning("Sin archivos", "No hay etiquetas en la carpeta.")
+            return
+
+        self.print_all_button.configure(state="disabled")
+        self.log_message(f"Imprimiendo {len(files)} etiquetas...")
+
+        def _print_thread():
+            printed = 0
+            for i, fname in enumerate(files):
+                filepath = os.path.join(self.last_output_dir, fname)
                 try:
-                    doc.close()
-                except:
-                    pass
+                    result = print_image(filepath, printer)
+                    if result and result.returncode == 0:
+                        printed += 1
+                        self.after(0, lambda f=fname: self.append_log(f"  OK: {f}"))
+                    elif result:
+                        self.after(0, lambda f=fname, e=result.stderr.strip():
+                            self.append_log(f"  Error: {f} - {e}"))
+                except Exception as e:
+                    self.after(0, lambda f=fname, err=str(e):
+                        self.append_log(f"  Error: {f} - {err}"))
+                self.after(0, lambda p=(i+1)/len(files): self.progress_bar.set(p))
 
-    def _scale_to_final(self, img):
-        """
-        Escala la imagen al tamaño final exacto (150mm x 62mm).
-        Mantiene proporción y centra con fondo blanco.
-        """
-        # Tamaño actual
-        src_width, src_height = img.size
+            self.after(0, lambda: self.print_all_button.configure(state="normal"))
+            self.after(0, lambda: self.append_log(f"Listo: {printed}/{len(files)} impresas"))
+            self.after(0, lambda: messagebox.showinfo("Impresion", f"{printed} etiquetas enviadas"))
 
-        # Margen interno (2mm a 300 DPI = ~24 px)
-        margin = 24
-        available_width = FINAL_WIDTH_PX - (2 * margin)
-        available_height = FINAL_HEIGHT_PX - (2 * margin)
+        thread = threading.Thread(target=_print_thread)
+        thread.daemon = True
+        thread.start()
 
-        # Calcular escala para llenar el área disponible
-        scale_w = available_width / src_width
-        scale_h = available_height / src_height
-        scale = min(scale_w, scale_h)
-
-        # Nuevo tamaño
-        new_width = int(src_width * scale)
-        new_height = int(src_height * scale)
-
-        # Redimensionar con alta calidad
-        img_scaled = img.resize((new_width, new_height), Image.LANCZOS)
-
-        # Crear canvas blanco del tamaño final exacto
-        canvas = Image.new('RGB', (FINAL_WIDTH_PX, FINAL_HEIGHT_PX), (255, 255, 255))
-
-        # Centrar
-        x = (FINAL_WIDTH_PX - new_width) // 2
-        y = (FINAL_HEIGHT_PX - new_height) // 2
-
-        canvas.paste(img_scaled, (x, y))
-
+    def _fit_to_canvas(self, img, canvas_w, canvas_h):
+        src_w, src_h = img.size
+        margin = mm_to_px(1)
+        avail_w, avail_h = canvas_w - 2*margin, canvas_h - 2*margin
+        scale = min(avail_w/src_w, avail_h/src_h)
+        new_w, new_h = int(src_w*scale), int(src_h*scale)
+        img_scaled = img.resize((new_w, new_h), Image.LANCZOS)
+        canvas = Image.new('RGB', (canvas_w, canvas_h), (255, 255, 255))
+        canvas.paste(img_scaled, ((canvas_w-new_w)//2, (canvas_h-new_h)//2))
         return canvas
 
-    def _finish_processing(self, count, output_dir):
+    def _finish_processing(self, saved, printed, output_dir):
         self.processing = False
-        self.process_button.configure(state="normal", text="⚡  Procesar Etiquetas")
+        self.save_button.configure(state="normal")
+        self.print_button.configure(state="normal")
         self.select_button.configure(state="normal")
-
-        self.append_log(f"\n{'='*40}")
-        self.append_log(f"✅ ¡COMPLETADO!")
-        self.append_log(f"   {count} etiquetas guardadas")
-        self.append_log(f"   📁 {output_dir}")
-
+        self.last_output_dir = output_dir
+        self.print_all_button.configure(state="normal")
+        self.append_log(f"Listo: {saved} guardadas" + (f", {printed} impresas" if printed else ""))
         try:
-            if os.name == 'nt':
-                os.startfile(output_dir)
-            elif sys.platform == 'darwin':
-                subprocess.run(['open', output_dir], check=False)
-            else:
-                subprocess.run(['xdg-open', output_dir], check=False)
-        except Exception:
-            pass
-
-        messagebox.showinfo(
-            "Proceso completado",
-            f"Se han guardado {count} etiquetas en:\n{output_dir}"
-        )
+            if os.name == 'nt': os.startfile(output_dir)
+            elif sys.platform == 'darwin': subprocess.run(['open', output_dir], check=False)
+            else: subprocess.run(['xdg-open', output_dir], check=False)
+        except: pass
+        msg = f"{saved} etiquetas guardadas"
+        if printed: msg += f"\n{printed} enviadas a impresora"
+        messagebox.showinfo("Listo", msg + f"\n\n{output_dir}")
 
     def _handle_error(self, error_message):
         self.processing = False
-        self.process_button.configure(state="normal", text="⚡  Procesar Etiquetas")
+        self.save_button.configure(state="normal")
+        self.print_button.configure(state="normal")
         self.select_button.configure(state="normal")
         self.progress_bar.set(0)
+        self.append_log(f"ERROR: {error_message}")
+        messagebox.showerror("Error", error_message)
 
-        self.append_log(f"\n❌ ERROR: {error_message}")
-        messagebox.showerror("Error", f"Ocurrió un error:\n{error_message}")
+    def log_message(self, msg):
+        self.result_text.configure(state="normal")
+        self.result_text.delete("1.0", "end")
+        self.result_text.insert("1.0", msg)
+        self.result_text.configure(state="disabled")
+
+    def append_log(self, msg):
+        self.result_text.configure(state="normal")
+        self.result_text.insert("end", f"\n{msg}")
+        self.result_text.see("end")
+        self.result_text.configure(state="disabled")
 
 
 def main():
     app = EtiquetaSeparador()
     app.mainloop()
-
 
 if __name__ == "__main__":
     main()
