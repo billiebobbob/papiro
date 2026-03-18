@@ -220,10 +220,10 @@ class EtiquetaSeparador(ctk.CTk):
 
     def _get_canvas_size(self):
         """Returns (width_px, height_px) for the image.
-        width = ancho de cinta (62mm siempre), height = largo de corte (152mm envio, 62mm producto)
-        Imagen PORTRAIT: ancho coincide con cinta, alto determina corte."""
+        width = largo de etiqueta (152mm envio), height = ancho cinta (62mm)
+        Imagen LANDSCAPE: el PowerShell crea PaperSize custom desde el DPI."""
         fmt = LABEL_FORMATS[self.selected_format.get()]
-        return mm_to_px(fmt["tape_width_mm"]), mm_to_px(fmt["cut_length_mm"])
+        return mm_to_px(fmt["cut_length_mm"]), mm_to_px(fmt["tape_width_mm"])
 
     def _on_format_change(self, *args):
         fmt = LABEL_FORMATS[self.selected_format.get()]
@@ -684,15 +684,6 @@ class EtiquetaSeparador(ctk.CTk):
 
     def _fit_to_canvas(self, img, canvas_w, canvas_h):
         src_w, src_h = img.size
-
-        # Auto-rotar si la orientacion no coincide con el canvas
-        # Ej: etiqueta landscape (152x62) en canvas portrait (62x152) → rotar 90° CCW
-        src_landscape = src_w > src_h
-        canvas_landscape = canvas_w > canvas_h
-        if src_landscape != canvas_landscape:
-            img = img.rotate(90, expand=True)
-            src_w, src_h = img.size
-
         margin = mm_to_px(1)
         avail_w, avail_h = canvas_w - 2*margin, canvas_h - 2*margin
         scale = min(avail_w/src_w, avail_h/src_h)
